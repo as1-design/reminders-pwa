@@ -655,6 +655,1259 @@ self.addEventListener('message', e => {
   if (d.type === 'CANCEL') {
     clearTimer(d.id);
   }
+
+  if (d.type === 'FIRE_NOW') {
+    fireNotification(d.reminder);
+  }
+});
+
+function clearTimer(id) {
+  if (timers.has(id)) { clearTimeout(timers.get(id)); timers.delete(id); }
+}
+
+function fireNotification(r) {
+  const title = (r.emoji ? r.emoji + ' ' : '') + r.title;
+  self.registration.showNotification(title, {
+    body: r.message || '',
+    tag: r.id,
+    requireInteraction: true,
+    actions: [
+      { action: 'done',  title: '✅ Done'  },
+      { action: 'snooze', title: '😴 Snooze' }
+    ],
+    data: { reminderId: r.id }
+  });
+}
+
+self.addEventListener('notificationclick', e => {
+  e.notification.close();
+  const reminderId = (e.notification.data || {}).reminderId;
+  const action = e.action || 'open';
+  e.waitUntil(
+    self.clients.matchAll({ type: 'window', includeUncontrolled: true }).then(cs => {
+      const msg = {
+        type: action === 'done' ? 'NOTIF_DONE' : 'NOTIF_SNOOZE',
+        reminderId
+      };
+      if (cs.length > 0) {
+        cs[0].focus();
+        cs[0].postMessage(msg);
+      } else {
+        self.clients.openWindow(pageUrl || '/').then(c => c && c.postMessage(msg));
+      }
+    })
+  );
+});
+`;
+
+let swReg = null;
+
+// Waits for the SW to reach 'activated' without requiring it to control this page.
+// navigator.serviceWorker.ready is intentionally avoided — it only resolves when a
+// SW controls the current page, which a blob-URL SW never does (its scope can't
+// match an https:// page URL). We need the SW active so we can postMessage to it.
+async function waitForSWActive(reg) {
+  if (reg.active) return;
+  return new Promise(resolve => {
+    const sw = reg.installing || reg.waiting;
+    if (!sw) { resolve(); return; }
+    function onState() {
+      if (reg.active) {
+        sw.removeEventListener('statechange', onState);
+        resolve();
+      }
+    }
+    sw.addEventListener('statechange', onState);
+    // Re-check immediately after attaching — closes the race window where the SW
+    // activated between our earlier check and the addEventListener call above.
+    if (reg.active) resolve();
+    // Safety valve: unblock after 5 s in case statechange never fires.
+    setTimeout(resolve, 5000);
+  });
+}
+
+async function registerSW() {
+  if (!('serviceWorker' in navigator)) return;
+  try {
+    const blob = new Blob([SW_SRC], { type: 'application/javascript' });
+    const url  = URL.createObjectURL(blob);
+    // No scope arg — passing scope: './' was resolved relative to the blob URL's
+    // path and either threw SecurityError or produced a scope that never matched
+    // the page, making navigator.serviceWorker.ready hang forever.
+    swReg = await navigator.serviceWorker.register(url);
+    navigator.serviceWorker.addEventListener('message', onSWMessage);
+    await waitForSWActive(swReg);
+    // Tell the SW the real page URL so notificationclick can openWindow correctly.
+    postSW({ type: 'INIT', pageUrl: location.href });
+    scheduleAll();
+  } catch (err) {
+    console.warn('[SW]', err);
+  }
+}
+
+function postSW(msg) {
+  if (!swReg) return;
+  // Prefer swReg.active directly — controller is only set when the SW controls
+  // this page, which a blob-URL SW never does. swReg.active works regardless.
+  const sw = swReg.active || swReg.waiting || swReg.installing;
+  if (sw) sw.postMessage(msg);
+}
+
+function onSWMessage(e) {
+  const { type, reminderId } = e.data || {};
+  if (type === 'NOTIF_DONE')  markDone(reminderId);
+  if (type === 'NOTIF_SNOOZE') { pendingSnoozeId = reminderId; openSnoozeModal(); }
+}
+
+// ================================================================
+// DATA
+// ================================================================
+function loadReminders() {
+  try {
+    const data = JSON.parse(localStorage.getItem('reminders') || '[]');
+    return Array.isArray(data) ? data : [];
+  } catch { return []; }
+}
+
+function trimToOneEmoji(str) {
+  if (!str) return '';
+  if (typeof Intl !== 'undefined' && Intl.Segmenter) {
+    const segs = [...new Intl.Segmenter().segment(str)];
+    return segs.length ? segs[0].segment : '';
+  }
+  // Fallback: first Unicode code point (spread splits on code points, not UTF-16 units)
+  return [...str][0] || '';
+}
+function saveReminders(arr) { localStorage.setItem('reminders', JSON.stringify(arr)); }
+
+function genId() {
+  if (crypto.randomUUID) return crypto.randomUUID();
+  return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, c => {
+    const r = Math.random() * 16 | 0;
+    return (c === 'x' ? r : (r & 0x3 | 0x8)).toString(16);
+  });
+}
+
+// ================================================================
+// NOTIFICATIONS
+// ================================================================
+async function requestNotifPermission() {
+  const r = await Notification.requestPermission();
+  checkNotifBanner();
+  if (r === 'granted') scheduleAll();
+}
+
+function checkNotifBanner() {
+  const banner = document.getElementById('notif-banner');
+  const text   = document.getElementById('notif-banner-text');
+  const btn    = document.getElementById('notif-enable-btn');
+
+  function show(msg, showBtn, denied) {
+    text.textContent = msg;
+    btn.style.display = showBtn ? '' : 'none';
+    banner.classList.toggle('denied', !!denied);
+    banner.classList.add('show');
+  }
+  function hide() { banner.classList.remove('show', 'denied'); }
+
+  if (!('Notification' in window)) {
+    show('🔕 Notifications are not supported in this browser.', false, false);
+    return;
+  }
+
+  // Chrome on Android blocks both SW registration and the Notifications API on
+  // plain http:// (non-localhost). Surface this clearly rather than silently failing.
+  const insecureHTTP = location.protocol === 'http:' &&
+    location.hostname !== 'localhost' && location.hostname !== '127.0.0.1';
+  if (insecureHTTP) {
+    show('🔒 Notifications require HTTPS. Deploy the app to a secure URL (e.g. GitHub Pages) to enable them.', false, false);
+    return;
+  }
+
+  const p = Notification.permission;
+  if (p === 'granted') {
+    hide();
+  } else if (p === 'denied') {
+    show('🚫 Notifications blocked — go to Android Settings → Apps → Reminders → Notifications to enable.', false, true);
+  } else {
+    show('🔔 Enable notifications to receive reminders', true, false);
+  }
+}
+
+function nextTrigger(r) {
+  const [h, m] = r.time.split(':').map(Number);
+  const now = new Date();
+  const t = new Date();
+  t.setHours(h, m, 0, 0);
+  if (t <= now) {
+    if      (r.recurrence === 'daily')  t.setDate(t.getDate() + 1);
+    else if (r.recurrence === 'weekly') t.setDate(t.getDate() + 7);
+    else return null;
+  }
+  return t.getTime();
+}
+
+// Main-thread timers — more reliable than SW timers because the SW is evicted
+// by Chrome after ~30 s of inactivity, killing any scheduled setTimeout inside it.
+const mainTimers = new Map();
+
+function scheduleReminder(r) {
+  if (!r.active) return;
+  if (!('Notification' in window) || Notification.permission !== 'granted') return;
+  const triggerAt = nextTrigger(r);
+  if (!triggerAt) return;
+
+  // Clear any existing main-thread timer for this reminder.
+  if (mainTimers.has(r.id)) {
+    clearTimeout(mainTimers.get(r.id));
+    mainTimers.delete(r.id);
+  }
+
+  // SW schedule: best-effort for when the page is in the background.
+  postSW({ type: 'SCHEDULE', reminder: r, triggerAt });
+
+  // Main-thread schedule: primary path when the tab is open.
+  // When it fires we ask the SW to call showNotification (required on Android
+  // Chrome — new Notification() is blocked on mobile from the main thread).
+  // Desktop falls back to new Notification() when no SW is available.
+  const delay = triggerAt - Date.now();
+  if (delay <= 0) return;
+  const tid = setTimeout(() => {
+    mainTimers.delete(r.id);
+    const fresh = loadReminders().find(x => x.id === r.id);
+    if (!fresh || !fresh.active) return;
+    if (swReg && swReg.active) {
+      postSW({ type: 'FIRE_NOW', reminder: fresh });
+    } else {
+      try {
+        new Notification((fresh.emoji ? fresh.emoji + ' ' : '') + fresh.title, {
+          body: fresh.message || '', tag: fresh.id, requireInteraction: true
+        });
+      } catch (e) { /* silently blocked on Android without SW */ }
+    }
+    // Reschedule if recurring (wait 1 s so nextTrigger sees a future time).
+    if (fresh.recurrence !== 'none') {
+      setTimeout(() => {
+        const r2 = loadReminders().find(x => x.id === fresh.id);
+        if (r2 && r2.active) scheduleReminder(r2);
+      }, 1000);
+    }
+  }, delay);
+  mainTimers.set(r.id, tid);
+}
+
+function cancelReminder(r) {
+  postSW({ type: 'CANCEL', id: r.id });
+  if (mainTimers.has(r.id)) {
+    clearTimeout(mainTimers.get(r.id));
+    mainTimers.delete(r.id);
+  }
+}
+
+function scheduleAll() {
+  loadReminders().forEach(scheduleReminder);
+}
+
+// ================================================================
+// ACTIONS
+// ================================================================
+function markDone(id) {
+  const rs = loadReminders();
+  const r  = rs.find(x => x.id === id);
+  if (!r) return;
+  r.completedCount  = (r.completedCount  || 0) + 1;
+  r.lastCompletedAt = Date.now();
+  if (r.recurrence === 'none') r.active = false;
+  saveReminders(rs);
+  if (r.active) scheduleReminder(r);
+  if (document.getElementById('screen-reminders').classList.contains('active')) renderReminders();
+}
+
+let pendingSnoozeId = null;
+
+function doSnooze(opt) {
+  closeSnoozeModal();
+  const id = pendingSnoozeId;
+  pendingSnoozeId = null;
+  if (!id) return;
+
+  const rs = loadReminders();
+  const r  = rs.find(x => x.id === id);
+  if (!r) return;
+  r.snoozeCount    = (r.snoozeCount    || 0) + 1;
+  r.lastSnoozedAt  = Date.now();
+  saveReminders(rs);
+
+  let triggerAt;
+  if (opt === 'tomorrow') {
+    const [h, m] = r.time.split(':').map(Number);
+    const t = new Date();
+    t.setDate(t.getDate() + 1);
+    t.setHours(h, m, 0, 0);
+    triggerAt = t.getTime();
+  } else {
+    triggerAt = Date.now() + opt * 60 * 1000;
+  }
+
+  postSW({ type: 'SCHEDULE', reminder: r, triggerAt });
+  if (document.getElementById('screen-reminders').classList.contains('active')) renderReminders();
+}
+
+// ================================================================
+// TAB NAVIGATION
+// ================================================================
+function showTab(tab, isNew) {
+  document.querySelectorAll('.screen').forEach(s => s.classList.remove('active'));
+  document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
+
+  const screenId = tab === 'form' ? 'screen-form' : 'screen-' + tab;
+  document.getElementById(screenId).classList.add('active');
+  const btn = document.querySelector('[data-tab="' + tab + '"]');
+  if (btn) btn.classList.add('active');
+
+  document.getElementById('fab').classList.toggle('hidden', tab !== 'reminders');
+
+  if (tab === 'reminders')   renderReminders();
+  else if (tab === 'form')   isNew ? openNewForm() : null;
+  else if (tab === 'reflection') renderReflection();
+}
+
+// ================================================================
+// RENDER — REMINDERS LIST
+// ================================================================
+function esc(s) {
+  return String(s)
+    .replace(/&/g,'&amp;').replace(/</g,'&lt;')
+    .replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+}
+
+function fmt12(hhmm) {
+  const [h, m] = hhmm.split(':').map(Number);
+  const ap = h < 12 ? 'AM' : 'PM';
+  return (h % 12 || 12) + ':' + String(m).padStart(2,'0') + ' ' + ap;
+}
+
+function renderReminders() {
+  const rs   = loadReminders();
+  const list = document.getElementById('reminders-list');
+  const sub  = document.getElementById('reminders-subtitle');
+
+  const active = rs.filter(r => r.active).length;
+  sub.textContent = rs.length === 0
+    ? 'No reminders yet'
+    : active + ' active · ' + rs.length + ' total';
+
+  if (rs.length === 0) {
+    list.innerHTML =
+      '<div class="empty-state">' +
+        '<div class="empty-icon">🔔</div>' +
+        '<h3>No reminders yet</h3>' +
+        '<p>Tap + to create your first reminder</p>' +
+      '</div>';
+    return;
+  }
+
+  list.innerHTML = rs.map(r => {
+    const rec   = r.recurrence === 'daily' ? 'Daily' : r.recurrence === 'weekly' ? 'Weekly' : 'Once';
+    const stats = [
+      r.completedCount ? '✅ ' + r.completedCount : '',
+      r.snoozeCount    ? '😴 ' + r.snoozeCount    : ''
+    ].filter(Boolean).join(' · ');
+    const emojiEl = r.emoji
+      ? '<div class="r-emoji">' + esc(r.emoji) + '</div>'
+      : '<div class="r-emoji-placeholder">🔔</div>';
+    return (
+      '<div class="reminder-item' + (r.active ? '' : ' inactive') + '" ' +
+           'onclick="openEditForm(\'' + r.id + '\')">' +
+        emojiEl +
+        '<div class="r-info">' +
+          '<div class="r-title">' + esc(r.title) + '</div>' +
+          '<div class="r-meta">' + fmt12(r.time) + ' · ' + rec + (stats ? ' · ' + stats : '') + '</div>' +
+        '</div>' +
+        '<div class="toggle-wrap" onclick="event.stopPropagation()">' +
+          '<label class="toggle">' +
+            '<input type="checkbox"' + (r.active ? ' checked' : '') +
+              ' onchange="toggleActive(\'' + r.id + '\',this.checked)">' +
+            '<div class="toggle-track"></div>' +
+            '<div class="toggle-thumb"></div>' +
+          '</label>' +
+        '</div>' +
+      '</div>'
+    );
+  }).join('');
+}
+
+function toggleActive(id, checked) {
+  const rs = loadReminders();
+  const r  = rs.find(x => x.id === id);
+  if (!r) return;
+  r.active = checked;
+  saveReminders(rs);
+  if (checked) scheduleReminder(r); else cancelReminder(r);
+  renderReminders();
+}
+
+// ================================================================
+// RENDER — FORM
+// ================================================================
+function openNewForm() {
+  editingId = null;
+  document.getElementById('form-heading').textContent = 'New Reminder';
+  document.getElementById('f-title').value = '';
+  document.getElementById('f-message').value = '';
+  document.getElementById('f-emoji').value = '';
+  const now = new Date();
+  document.getElementById('f-time').value =
+    String(now.getHours()).padStart(2,'0') + ':' + String(now.getMinutes()).padStart(2,'0');
+  document.getElementById('f-recurrence').value = 'none';
+  document.getElementById('f-active').checked = true;
+  document.getElementById('delete-btn').style.display = 'none';
+  document.getElementById('f-title').classList.remove('error');
+}
+
+let editingId = null;
+
+function openEditForm(id) {
+  const rs = loadReminders();
+  const r  = rs.find(x => x.id === id);
+  if (!r) return;
+  editingId = id;
+  document.getElementById('form-heading').textContent = 'Edit Reminder';
+  document.getElementById('f-title').value       = r.title;
+  document.getElementById('f-message').value     = r.message || '';
+  document.getElementById('f-emoji').value       = r.emoji   || '';
+  document.getElementById('f-time').value        = r.time;
+  document.getElementById('f-recurrence').value  = r.recurrence;
+  document.getElementById('f-active').checked    = r.active;
+  document.getElementById('delete-btn').style.display = 'block';
+  document.getElementById('f-title').classList.remove('error');
+  showTab('form');
+}
+
+function saveReminder() {
+  const title = document.getElementById('f-title').value.trim();
+  const time  = document.getElementById('f-time').value;
+  const el    = document.getElementById('f-title');
+
+  if (!title) {
+    el.classList.add('error');
+    el.focus();
+    setTimeout(() => el.classList.remove('error'), 1800);
+    return;
+  }
+
+  const rs = loadReminders();
+
+  if (editingId) {
+    const r = rs.find(x => x.id === editingId);
+    if (r) {
+      cancelReminder(r);
+      r.title       = title;
+      r.message     = document.getElementById('f-message').value.trim();
+      r.emoji       = trimToOneEmoji(document.getElementById('f-emoji').value.trim());
+      r.time        = time;
+      r.recurrence  = document.getElementById('f-recurrence').value;
+      r.active      = document.getElementById('f-active').checked;
+      saveReminders(rs);
+      scheduleReminder(r);
+    }
+  } else {
+    const r = {
+      id:              genId(),
+      title,
+      message:         document.getElementById('f-message').value.trim(),
+      emoji:           trimToOneEmoji(document.getElementById('f-emoji').value.trim()),
+      time,
+      recurrence:      document.getElementById('f-recurrence').value,
+      active:          document.getElementById('f-active').checked,
+      createdAt:       Date.now(),
+      completedCount:  0,
+      snoozeCount:     0,
+      lastCompletedAt: null,
+      lastSnoozedAt:   null
+    };
+    rs.push(r);
+    saveReminders(rs);
+    scheduleReminder(r);
+  }
+
+  editingId = null;
+  showTab('reminders');
+}
+
+function deleteReminder() {
+  if (!editingId) return;
+  const rs = loadReminders();
+  const r  = rs.find(x => x.id === editingId);
+  if (r) cancelReminder(r);
+  saveReminders(rs.filter(x => x.id !== editingId));
+  editingId = null;
+  showTab('reminders');
+}
+
+// ================================================================
+// SNOOZE MODAL
+// ================================================================
+function openSnoozeModal()  { document.getElementById('snooze-modal').classList.add('show'); }
+function closeSnoozeModal() { document.getElementById('snooze-modal').classList.remove('show'); }
+function handleModalBackdrop(e) { if (e.target === e.currentTarget) closeSnoozeModal(); }
+
+// ================================================================
+// RENDER — WEEKLY REFLECTION
+// ================================================================
+function renderReflection() {
+  const rs  = loadReminders();
+  const now = Date.now();
+
+  const start = new Date(now - 7 * 864e5);
+  const end   = new Date(now);
+  const fmt   = d => d.toLocaleDateString(undefined, { month: 'short', day: 'numeric' });
+  document.getElementById('reflection-range').textContent = fmt(start) + ' – ' + fmt(end);
+
+  let triggered = 0, completed = 0, snoozes = 0;
+  let topSnoozeR = null, topSnoozeN = 0;
+
+  rs.forEach(r => {
+    const c = r.completedCount || 0;
+    const s = r.snoozeCount    || 0;
+    triggered += c + s;
+    completed += c;
+    snoozes   += s;
+    if (s > topSnoozeN) { topSnoozeN = s; topSnoozeR = r; }
+  });
+
+  const rate = triggered > 0 ? Math.round((completed / triggered) * 100) : 0;
+
+  const mostSnoozedCard = (topSnoozeR && topSnoozeN > 0)
+    ? '<div class="metric-card wide">' +
+        '<div class="metric-secondary">' + esc((topSnoozeR.emoji || '') + ' ' + topSnoozeR.title).trim() + '</div>' +
+        '<div class="metric-label">Most snoozed reminder · ' + topSnoozeN + ' times</div>' +
+      '</div>'
+    : '';
+
+  const insights = buildInsights(rate, snoozes, triggered, topSnoozeR, topSnoozeN);
+
+  document.getElementById('reflection-body').innerHTML =
+    '<div class="metric-grid">' +
+      '<div class="metric-card"><div class="metric-val">' + triggered + '</div><div class="metric-label">Reminders triggered</div></div>' +
+      '<div class="metric-card"><div class="metric-val">' + rate + '%</div><div class="metric-label">Completion rate</div></div>' +
+      '<div class="metric-card"><div class="metric-val">' + completed + '</div><div class="metric-label">Completed</div></div>' +
+      '<div class="metric-card"><div class="metric-val">' + snoozes + '</div><div class="metric-label">Total snoozes</div></div>' +
+      mostSnoozedCard +
+    '</div>' +
+    '<div class="insights">' +
+      '<div class="insights-heading">Insights</div>' +
+      insights.map(i => '<div class="insight-line">' + i + '</div>').join('') +
+    '</div>';
+}
+
+function buildInsights(rate, snoozes, total, topR, topN) {
+  const lines = [];
+
+  if (total === 0) {
+    lines.push('🌱 No activity yet this week. Set some reminders to start building a habit.');
+    return lines;
+  }
+
+  if (rate === 100)      lines.push('🎉 Perfect week — everything done. Enjoy that.');
+  else if (rate >= 80)   lines.push('🌱 You completed ' + rate + '% of your reminders this week. Solid consistency.');
+  else if (rate >= 50)   lines.push('📈 ' + rate + '% done. You\'re on the right track — a few tweaks could lift that further.');
+  else if (rate > 0)     lines.push('💛 A challenging week — ' + rate + '% completion. That\'s okay. Tomorrow is a fresh start.');
+  else                   lines.push('🌙 Nothing completed this week. Consider whether the timing or frequency feels right for you.');
+
+  if (snoozes === 0)        lines.push('✨ Zero snoozes this week. Your schedule is working well.');
+  else if (snoozes >= 10)   lines.push('😴 You snoozed ' + snoozes + ' times. It might be worth adjusting a few timings.');
+  else                      lines.push('😴 You hit snooze ' + snoozes + ' time' + (snoozes !== 1 ? 's' : '') + ' this week.');
+
+  if (topR && topN >= 3) {
+    const shift = topN >= 5 ? '30–60' : '15–30';
+    lines.push('⚠️ Most snoozed: "' + esc(topR.title) + '". Consider moving it ' + shift + ' minutes later.');
+  }
+
+  return lines;
+}
+
+// ================================================================
+// INIT
+// ================================================================
+async function init() {
+  registerSW();
+  checkNotifBanner();
+  renderReminders();
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'visible') {
+      checkNotifBanner();
+      if (Notification.permission === 'granted') scheduleAll();
+    }
+  });
+  // Trim emoji field to one grapheme cluster as the user types
+  document.getElementById('f-emoji').addEventListener('input', function () {
+    const trimmed = trimToOneEmoji(this.value);
+    if (this.value !== trimmed) this.value = trimmed;
+  });
+}
+
+init();
+</script>
+</body>
+</html>
+!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+  <meta name="theme-color" content="#5b6e4e">
+  <meta name="mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="default">
+  <meta name="apple-mobile-web-app-title" content="Reminders">
+  <title>Reminders</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    :root {
+      --bg: #f7f4f0;
+      --surface: #ffffff;
+      --surface2: #f0ece6;
+      --border: #e8e2da;
+      --text: #2d2926;
+      --text2: #7a7169;
+      --accent: #5b6e4e;
+      --accent-light: #e8f0e2;
+      --danger: #c0392b;
+      --danger-light: #fdf0ee;
+      --toggle-off: #ccc8c2;
+      --toggle-on: #5b6e4e;
+      --tab-h: 64px;
+      --safe-b: env(safe-area-inset-bottom, 0px);
+    }
+
+    html, body {
+      height: 100%;
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      font-size: 16px;
+      line-height: 1.5;
+      -webkit-font-smoothing: antialiased;
+      overflow: hidden;
+    }
+
+    #app {
+      display: flex;
+      flex-direction: column;
+      height: 100%;
+      max-width: 480px;
+      margin: 0 auto;
+      position: relative;
+    }
+
+    .screen {
+      display: none;
+      flex: 1;
+      overflow-y: auto;
+      height: 100%;
+      padding-bottom: calc(var(--tab-h) + var(--safe-b) + 24px);
+    }
+    .screen.active { display: block; }
+
+    /* ---- TAB BAR ---- */
+    #tab-bar {
+      position: fixed;
+      bottom: 0;
+      left: 50%;
+      transform: translateX(-50%);
+      width: 100%;
+      max-width: 480px;
+      height: calc(var(--tab-h) + var(--safe-b));
+      padding-bottom: var(--safe-b);
+      background: var(--surface);
+      border-top: 1px solid var(--border);
+      display: flex;
+      z-index: 100;
+    }
+
+    .tab-btn {
+      flex: 1;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      gap: 3px;
+      border: none;
+      background: none;
+      cursor: pointer;
+      color: var(--text2);
+      font-size: 11px;
+      font-weight: 600;
+      letter-spacing: 0.2px;
+      transition: color 0.15s;
+      padding: 8px 0;
+      -webkit-tap-highlight-color: transparent;
+    }
+    .tab-btn .tab-icon { font-size: 22px; line-height: 1; }
+    .tab-btn.active { color: var(--accent); }
+
+    /* ---- PAGE HEADER ---- */
+    .page-header {
+      padding: 22px 20px 10px;
+      background: var(--bg);
+      position: sticky;
+      top: 0;
+      z-index: 10;
+    }
+    .page-header h1 {
+      font-size: 30px;
+      font-weight: 800;
+      letter-spacing: -0.5px;
+      color: var(--text);
+    }
+    .page-header .subtitle {
+      font-size: 14px;
+      color: var(--text2);
+      margin-top: 2px;
+    }
+
+    /* ---- NOTIFICATION BANNER ---- */
+    #notif-banner {
+      margin: 10px 16px 0;
+      padding: 12px 14px;
+      background: #fff8e1;
+      border: 1px solid #ffe082;
+      border-radius: 12px;
+      font-size: 14px;
+      display: none;
+      align-items: center;
+      gap: 10px;
+    }
+    #notif-banner.show { display: flex; }
+    #notif-banner.denied {
+      background: #fdf0ee;
+      border-color: #f5c6c0;
+    }
+    #notif-banner .notif-enable {
+      margin-left: auto;
+      background: #ffc107;
+      border: none;
+      border-radius: 8px;
+      padding: 5px 12px;
+      font-size: 13px;
+      font-weight: 700;
+      cursor: pointer;
+      color: #3e2800;
+      white-space: nowrap;
+    }
+
+    /* ---- REMINDERS LIST ---- */
+    #reminders-list { padding: 8px 16px; }
+
+    .empty-state {
+      text-align: center;
+      padding: 64px 24px;
+      color: var(--text2);
+    }
+    .empty-state .empty-icon { font-size: 52px; margin-bottom: 16px; }
+    .empty-state h3 { font-size: 20px; color: var(--text); margin-bottom: 8px; font-weight: 700; }
+    .empty-state p { font-size: 15px; }
+
+    .reminder-item {
+      background: var(--surface);
+      border-radius: 16px;
+      padding: 14px 16px;
+      margin-bottom: 10px;
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      cursor: pointer;
+      border: 1px solid var(--border);
+      transition: transform 0.1s;
+      -webkit-tap-highlight-color: transparent;
+      user-select: none;
+    }
+    .reminder-item:active { transform: scale(0.98); }
+    .reminder-item.inactive { opacity: 0.55; }
+
+    .r-emoji {
+      font-size: 28px;
+      min-width: 38px;
+      text-align: center;
+      line-height: 1;
+    }
+    .r-emoji-placeholder {
+      width: 38px;
+      height: 38px;
+      border-radius: 50%;
+      background: var(--surface2);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 17px;
+      color: var(--text2);
+      flex-shrink: 0;
+    }
+
+    .r-info { flex: 1; min-width: 0; }
+    .r-title {
+      font-size: 16px;
+      font-weight: 600;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      color: var(--text);
+    }
+    .r-meta {
+      font-size: 13px;
+      color: var(--text2);
+      margin-top: 2px;
+    }
+
+    /* Toggle */
+    .toggle-wrap { flex-shrink: 0; }
+    .toggle {
+      position: relative;
+      display: inline-block;
+      width: 46px;
+      height: 27px;
+    }
+    .toggle input { opacity: 0; width: 0; height: 0; position: absolute; }
+    .toggle-track {
+      position: absolute;
+      inset: 0;
+      border-radius: 14px;
+      background: var(--toggle-off);
+      transition: background 0.25s;
+      cursor: pointer;
+    }
+    .toggle input:checked + .toggle-track { background: var(--toggle-on); }
+    .toggle-thumb {
+      position: absolute;
+      top: 3px; left: 3px;
+      width: 21px; height: 21px;
+      border-radius: 50%;
+      background: white;
+      box-shadow: 0 1px 4px rgba(0,0,0,0.25);
+      transition: transform 0.25s cubic-bezier(.34,1.56,.64,1);
+      pointer-events: none;
+    }
+    .toggle input:checked ~ .toggle-thumb { transform: translateX(19px); }
+
+    /* FAB */
+    #fab {
+      position: fixed;
+      bottom: calc(var(--tab-h) + var(--safe-b) + 18px);
+      right: max(18px, calc(50% - 222px));
+      width: 56px; height: 56px;
+      border-radius: 28px;
+      background: var(--accent);
+      color: white;
+      border: none;
+      font-size: 30px;
+      line-height: 1;
+      cursor: pointer;
+      box-shadow: 0 4px 14px rgba(91,110,78,0.45);
+      z-index: 50;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      transition: transform 0.15s, box-shadow 0.15s;
+      -webkit-tap-highlight-color: transparent;
+    }
+    #fab:active { transform: scale(0.92); box-shadow: 0 2px 6px rgba(91,110,78,0.3); }
+    #fab.hidden { display: none; }
+
+    /* ---- FORM ---- */
+    .form-container { padding: 6px 16px 24px; }
+
+    .form-group { margin-bottom: 20px; }
+
+    .form-label {
+      display: block;
+      font-size: 12px;
+      font-weight: 700;
+      color: var(--text2);
+      text-transform: uppercase;
+      letter-spacing: 0.6px;
+      margin-bottom: 8px;
+    }
+
+    .form-input, .form-select, .form-textarea {
+      width: 100%;
+      padding: 13px 14px;
+      border: 1.5px solid var(--border);
+      border-radius: 12px;
+      background: var(--surface);
+      color: var(--text);
+      font-size: 16px;
+      font-family: inherit;
+      outline: none;
+      transition: border-color 0.15s;
+      -webkit-appearance: none;
+      appearance: none;
+    }
+    .form-input:focus, .form-select:focus, .form-textarea:focus {
+      border-color: var(--accent);
+    }
+    .form-input.error { border-color: var(--danger); }
+    .form-textarea { min-height: 80px; resize: vertical; }
+    .form-select {
+      background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='8' viewBox='0 0 12 8'%3E%3Cpath d='M1 1l5 5 5-5' stroke='%237a7169' stroke-width='1.5' fill='none' stroke-linecap='round'/%3E%3C/svg%3E");
+      background-repeat: no-repeat;
+      background-position: right 14px center;
+      padding-right: 36px;
+      cursor: pointer;
+    }
+
+    .checkbox-row {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      padding: 13px 14px;
+      background: var(--surface);
+      border: 1.5px solid var(--border);
+      border-radius: 12px;
+      cursor: pointer;
+      -webkit-tap-highlight-color: transparent;
+    }
+    .checkbox-row input[type="checkbox"] {
+      width: 20px; height: 20px;
+      accent-color: var(--accent);
+      cursor: pointer;
+      flex-shrink: 0;
+    }
+    .checkbox-row span { font-size: 16px; color: var(--text); }
+
+    .btn {
+      width: 100%;
+      padding: 15px;
+      border-radius: 14px;
+      border: none;
+      font-size: 16px;
+      font-weight: 700;
+      cursor: pointer;
+      transition: transform 0.1s, opacity 0.15s;
+      -webkit-tap-highlight-color: transparent;
+      font-family: inherit;
+    }
+    .btn:active { transform: scale(0.97); }
+    .btn-primary { background: var(--accent); color: white; }
+    .btn-danger { background: var(--danger-light); color: var(--danger); margin-top: 10px; }
+    .btn-ghost { background: var(--surface2); color: var(--text2); margin-top: 10px; }
+
+    /* ---- REFLECTION ---- */
+    .reflection-body { padding: 6px 16px 24px; }
+
+    .metric-grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 10px;
+      margin-bottom: 14px;
+    }
+    .metric-card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 16px;
+      padding: 18px 16px;
+    }
+    .metric-card.wide { grid-column: span 2; }
+    .metric-val {
+      font-size: 34px;
+      font-weight: 800;
+      line-height: 1;
+      color: var(--accent);
+      letter-spacing: -1px;
+    }
+    .metric-label {
+      font-size: 13px;
+      color: var(--text2);
+      margin-top: 5px;
+      font-weight: 500;
+    }
+    .metric-secondary {
+      font-size: 17px;
+      font-weight: 700;
+      color: var(--text);
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+
+    .insights {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 16px;
+      padding: 18px;
+    }
+    .insights-heading {
+      font-size: 12px;
+      font-weight: 700;
+      color: var(--text2);
+      text-transform: uppercase;
+      letter-spacing: 0.6px;
+      margin-bottom: 14px;
+    }
+    .insight-line {
+      font-size: 15px;
+      line-height: 1.65;
+      padding: 10px 0;
+      border-bottom: 1px solid var(--border);
+      color: var(--text);
+    }
+    .insight-line:first-of-type { padding-top: 0; }
+    .insight-line:last-child { border-bottom: none; padding-bottom: 0; }
+
+    /* ---- SNOOZE MODAL ---- */
+    #snooze-modal {
+      position: fixed;
+      inset: 0;
+      z-index: 300;
+      display: none;
+      align-items: flex-end;
+      justify-content: center;
+      background: rgba(0,0,0,0.45);
+      backdrop-filter: blur(2px);
+    }
+    #snooze-modal.show { display: flex; }
+
+    .snooze-sheet {
+      width: 100%;
+      max-width: 480px;
+      background: var(--surface);
+      border-radius: 24px 24px 0 0;
+      padding: 8px 20px calc(24px + var(--safe-b));
+      animation: slideUp 0.22s ease-out;
+    }
+    @keyframes slideUp {
+      from { transform: translateY(100%); }
+      to { transform: translateY(0); }
+    }
+
+    .snooze-handle {
+      width: 36px; height: 4px;
+      border-radius: 2px;
+      background: var(--border);
+      margin: 12px auto 18px;
+    }
+
+    .snooze-sheet h3 {
+      font-size: 19px;
+      font-weight: 800;
+      text-align: center;
+      margin-bottom: 16px;
+      color: var(--text);
+    }
+
+    .snooze-opt {
+      display: flex;
+      align-items: center;
+      gap: 14px;
+      padding: 16px;
+      background: var(--surface2);
+      border-radius: 14px;
+      margin-bottom: 10px;
+      cursor: pointer;
+      border: none;
+      width: 100%;
+      font-family: inherit;
+      color: var(--text);
+      -webkit-tap-highlight-color: transparent;
+      text-align: left;
+      transition: transform 0.1s;
+    }
+    .snooze-opt:active { transform: scale(0.97); }
+    .snooze-icon { font-size: 24px; flex-shrink: 0; }
+    .snooze-label strong { display: block; font-size: 16px; font-weight: 700; }
+    .snooze-label small { color: var(--text2); font-size: 13px; }
+
+    .snooze-cancel {
+      width: 100%;
+      padding: 14px;
+      background: none;
+      border: none;
+      color: var(--text2);
+      font-size: 16px;
+      font-family: inherit;
+      cursor: pointer;
+      margin-top: 2px;
+      font-weight: 600;
+    }
+  </style>
+</head>
+<body>
+<div id="app">
+
+  <!-- ── REMINDERS SCREEN ── -->
+  <section id="screen-reminders" class="screen active">
+    <div class="page-header">
+      <h1>Reminders</h1>
+      <div class="subtitle" id="reminders-subtitle">Your personal reminders</div>
+    </div>
+    <div id="notif-banner">
+      <span id="notif-banner-text">🔔 Enable notifications for reminders</span>
+      <button class="notif-enable" id="notif-enable-btn" onclick="requestNotifPermission()">Enable</button>
+    </div>
+    <div id="reminders-list"></div>
+  </section>
+
+  <!-- ── FORM SCREEN ── -->
+  <section id="screen-form" class="screen">
+    <div class="page-header">
+      <h1 id="form-heading">New Reminder</h1>
+    </div>
+    <div class="form-container">
+      <div class="form-group">
+        <label class="form-label" for="f-title">Title *</label>
+        <input class="form-input" id="f-title" type="text" placeholder="e.g. Take vitamins" maxlength="60" autocomplete="off">
+      </div>
+      <div class="form-group">
+        <label class="form-label" for="f-message">Message</label>
+        <textarea class="form-textarea" id="f-message" placeholder="Optional note…" maxlength="200"></textarea>
+      </div>
+      <div class="form-group">
+        <label class="form-label" for="f-emoji">Emoji</label>
+        <input class="form-input" id="f-emoji" type="text" placeholder="e.g. 💊" autocomplete="off" inputmode="text">
+      </div>
+      <div class="form-group">
+        <label class="form-label" for="f-time">Time *</label>
+        <input class="form-input" id="f-time" type="time">
+      </div>
+      <div class="form-group">
+        <label class="form-label" for="f-recurrence">Repeat</label>
+        <select class="form-select" id="f-recurrence">
+          <option value="none">No repeat</option>
+          <option value="daily">Every day</option>
+          <option value="weekly">Every week</option>
+        </select>
+      </div>
+      <div class="form-group">
+        <label class="checkbox-row" for="f-active">
+          <input type="checkbox" id="f-active" checked>
+          <span>Active — send notifications</span>
+        </label>
+      </div>
+      <button class="btn btn-primary" onclick="saveReminder()">Save Reminder</button>
+      <button class="btn btn-danger" id="delete-btn" onclick="deleteReminder()" style="display:none">Delete Reminder</button>
+      <button class="btn btn-ghost" onclick="showTab('reminders')">Cancel</button>
+    </div>
+  </section>
+
+  <!-- ── REFLECTION SCREEN ── -->
+  <section id="screen-reflection" class="screen">
+    <div class="page-header">
+      <h1>This Week</h1>
+      <div class="subtitle" id="reflection-range"></div>
+    </div>
+    <div class="reflection-body" id="reflection-body"></div>
+  </section>
+
+  <!-- ── TAB BAR ── -->
+  <nav id="tab-bar">
+    <button class="tab-btn active" data-tab="reminders" onclick="showTab('reminders')">
+      <span class="tab-icon">🔔</span>
+      <span>Reminders</span>
+    </button>
+    <button class="tab-btn" data-tab="form" onclick="showTab('form', true)">
+      <span class="tab-icon">✏️</span>
+      <span>Add</span>
+    </button>
+    <button class="tab-btn" data-tab="reflection" onclick="showTab('reflection')">
+      <span class="tab-icon">📊</span>
+      <span>Week</span>
+    </button>
+  </nav>
+</div>
+
+<!-- FAB -->
+<button id="fab" onclick="showTab('form', true)" aria-label="Add reminder">+</button>
+
+<!-- SNOOZE MODAL -->
+<div id="snooze-modal" role="dialog" aria-modal="true" onclick="handleModalBackdrop(event)">
+  <div class="snooze-sheet">
+    <div class="snooze-handle"></div>
+    <h3>😴 Snooze for how long?</h3>
+    <button class="snooze-opt" onclick="doSnooze(15)">
+      <span class="snooze-icon">⏰</span>
+      <span class="snooze-label"><strong>15 minutes</strong><small>Quick snooze</small></span>
+    </button>
+    <button class="snooze-opt" onclick="doSnooze(60)">
+      <span class="snooze-icon">🕐</span>
+      <span class="snooze-label"><strong>1 hour</strong><small>Come back later</small></span>
+    </button>
+    <button class="snooze-opt" onclick="doSnooze('tomorrow')">
+      <span class="snooze-icon">🌅</span>
+      <span class="snooze-label"><strong>Tomorrow, same time</strong><small>Skip for today</small></span>
+    </button>
+    <button class="snooze-cancel" onclick="closeSnoozeModal()">Cancel</button>
+  </div>
+</div>
+
+<script>
+// ================================================================
+// MANIFEST — injected as a blob-URL <link>
+// ================================================================
+(function injectManifest() {
+  const m = {
+    name: 'Reminders',
+    short_name: 'Reminders',
+    description: 'Personal reminder app with snooze tracking',
+    start_url: './',
+    display: 'standalone',
+    background_color: '#f7f4f0',
+    theme_color: '#5b6e4e',
+    orientation: 'portrait-primary',
+    icons: [
+      {
+        src: 'data:image/svg+xml,' + encodeURIComponent(
+          '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 192 192">' +
+          '<rect width="192" height="192" rx="40" fill="#5b6e4e"/>' +
+          '<text y="135" x="96" text-anchor="middle" font-size="115">🔔</text></svg>'
+        ),
+        sizes: '192x192',
+        type: 'image/svg+xml',
+        purpose: 'any maskable'
+      }
+    ]
+  };
+  const blob = new Blob([JSON.stringify(m)], { type: 'application/manifest+json' });
+  const link = document.createElement('link');
+  link.rel = 'manifest';
+  link.href = URL.createObjectURL(blob);
+  document.head.appendChild(link);
+})();
+
+// ================================================================
+// SERVICE WORKER — registered from a blob URL
+// ================================================================
+const SW_SRC = `
+'use strict';
+const timers = new Map();
+let pageUrl = '';
+
+self.addEventListener('install', () => self.skipWaiting());
+self.addEventListener('activate', e => e.waitUntil(self.clients.claim()));
+
+self.addEventListener('message', e => {
+  const d = e.data;
+  if (!d) return;
+
+  if (d.type === 'INIT') {
+    pageUrl = d.pageUrl;
+    return;
+  }
+
+  if (d.type === 'SCHEDULE') {
+    clearTimer(d.reminder.id);
+    const delay = d.triggerAt - Date.now();
+    if (delay < 0) return;
+    const tid = setTimeout(() => {
+      timers.delete(d.reminder.id);
+      fireNotification(d.reminder);
+    }, delay);
+    timers.set(d.reminder.id, tid);
+  }
+
+  if (d.type === 'CANCEL') {
+    clearTimer(d.id);
+  }
 });
 
 function clearTimer(id) {
